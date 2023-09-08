@@ -1,8 +1,10 @@
 ﻿using System.Text.Json;
+using System.Text.Json.Serialization;
 using HtmlAgilityPack;
 using MavenCopy.Data;
 using Serilog;
 using Serilog.Core;
+using Serilog.Events;
 
 namespace MavenCopy;
 
@@ -22,7 +24,11 @@ public class MavenCopier
     private readonly Stack<(MavenTreeRequest Request, int QueueId, int FailCount)> _queue = new();
     private readonly JsonSerializerOptions _options = new()
     {
-        WriteIndented = true
+        WriteIndented = true,
+        Converters =
+        {
+            new JsonStringEnumConverter()
+        }
     };
 
     public MavenCopier(Config config)
@@ -37,10 +43,21 @@ public class MavenCopier
             loggerConfiguration = loggerConfiguration.WriteTo.Console();
         }
 
-        if (config.WriteLog)
+        if (config.WriteFileLog)
         {
             loggerConfiguration = loggerConfiguration.WriteTo.File($"{_config.LogFolder}{Path.DirectorySeparatorChar}{DateTime.Now:yyyyMMdd}.log");
         }
+
+        loggerConfiguration = config.LogLevel switch
+        {
+            LogEventLevel.Debug => loggerConfiguration.MinimumLevel.Debug(),
+            LogEventLevel.Verbose => loggerConfiguration.MinimumLevel.Verbose(),
+            LogEventLevel.Information => loggerConfiguration.MinimumLevel.Information(),
+            LogEventLevel.Warning => loggerConfiguration.MinimumLevel.Warning(),
+            LogEventLevel.Error => loggerConfiguration.MinimumLevel.Error(),
+            LogEventLevel.Fatal => loggerConfiguration.MinimumLevel.Fatal(),
+            _ => throw new ArgumentOutOfRangeException()
+        };
         
         _logger = loggerConfiguration.CreateLogger();
 
@@ -203,7 +220,7 @@ public class MavenCopier
         _queueIdx++;
         Monitor.Exit(_queueLock);
         
-        _logger.Information("Enqueue (QueueId: {QueueId}, Url: {Url})", queueId, treeRequest.ToUri());
+        _logger.Debug("Enqueue (QueueId: {QueueId}, Url: {Url})", queueId, treeRequest.ToUri());
     }
 
     public async Task Start()
@@ -239,7 +256,7 @@ public class MavenCopier
             {
                 if (_queue.TryPop(out var tuple))
                 {
-                    _logger.Information("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", tuple.QueueId, tuple.FailCount + 1, tuple.Request.ToUri());
+                    _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", tuple.QueueId, tuple.FailCount + 1, tuple.Request.ToUri());
                     _taskList[endIdx] = DownloadTree(tuple.QueueId, endIdx, tuple.Request, tuple.FailCount);
                 }
                 else
@@ -253,7 +270,7 @@ public class MavenCopier
             var endTask = await Task.WhenAny(tasks);
             endIdx = Array.FindIndex(_taskList, task => endTask == task);
             var item = _queue.Pop();
-            _logger.Information("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", item.QueueId, item.FailCount + 1, item.Request.ToUri());
+            _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", item.QueueId, item.FailCount + 1, item.Request.ToUri());
             _taskList[endIdx] = DownloadTree(item.QueueId, endIdx, item.Request, item.FailCount);
         }
     }

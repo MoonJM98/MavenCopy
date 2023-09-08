@@ -1,4 +1,6 @@
-﻿namespace MavenCopy.Data;
+﻿using Serilog.Events;
+
+namespace MavenCopy.Data;
 
 [Serializable]
 public class Config
@@ -11,5 +13,6 @@ public class Config
     public int ParallelCount { get; set; } = 10;
     public long CacheExpireDate { get; set; } = 30;
     public bool ShowConsole { get; set; } = true;
-    public bool WriteLog { get; set; } = true;
+    public bool WriteFileLog { get; set; } = true;
+    public LogEventLevel LogLevel { get; set; } = LogEventLevel.Information;
 }
