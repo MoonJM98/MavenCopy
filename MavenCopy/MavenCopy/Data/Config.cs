@@ -1,4 +1,5 @@
-﻿using Serilog.Events;
+﻿using System.Text.Json.Serialization;
+using Serilog.Events;
 
 namespace MavenCopy.Data;
 
@@ -14,5 +15,7 @@ public class Config
     public long CacheExpireDate { get; set; } = 30;
     public bool ShowConsole { get; set; } = true;
     public bool WriteFileLog { get; set; } = true;
+    
+    [JsonConverter(typeof(JsonStringEnumConverter))]
     public LogEventLevel LogLevel { get; set; } = LogEventLevel.Information;
 }

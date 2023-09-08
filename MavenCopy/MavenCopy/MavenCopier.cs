@@ -21,7 +21,7 @@ public class MavenCopier
     private readonly object _queueLock = new();
     private readonly HttpClient _httpClient = new();
     private readonly HashSet<string> _failSets = new();
-    private readonly Stack<(MavenTreeRequest Request, int QueueId, int FailCount)> _queue = new();
+    private readonly Queue<(MavenTreeRequest Request, int QueueId, int FailCount)> _queue = new();
     private readonly JsonSerializerOptions _options = new()
     {
         WriteIndented = true,
@@ -216,7 +216,7 @@ public class MavenCopier
     {
         Monitor.Enter(_queueLock);
         var queueId = _queueIdx;
-        _queue.Push((treeRequest, queueId, failCount));
+        _queue.Enqueue((treeRequest, queueId, failCount));
         _queueIdx++;
         Monitor.Exit(_queueLock);
         
@@ -254,7 +254,7 @@ public class MavenCopier
             
             if (endIdx >= 0)
             {
-                if (_queue.TryPop(out var tuple))
+                if (_queue.TryDequeue(out var tuple))
                 {
                     _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", tuple.QueueId, tuple.FailCount + 1, tuple.Request.ToUri());
                     _taskList[endIdx] = DownloadTree(tuple.QueueId, endIdx, tuple.Request, tuple.FailCount);
@@ -269,7 +269,7 @@ public class MavenCopier
             var tasks = _taskList.Where(task => task != null).Select(task => task!).ToList();
             var endTask = await Task.WhenAny(tasks);
             endIdx = Array.FindIndex(_taskList, task => endTask == task);
-            var item = _queue.Pop();
+            var item = _queue.Dequeue();
             _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", item.QueueId, item.FailCount + 1, item.Request.ToUri());
             _taskList[endIdx] = DownloadTree(item.QueueId, endIdx, item.Request, item.FailCount);
         }
