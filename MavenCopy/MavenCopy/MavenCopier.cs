@@ -29,9 +29,18 @@ public class MavenCopier
         _httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36");
         
         var loggerConfiguration = new LoggerConfiguration();
-        _logger = loggerConfiguration
-            .WriteTo.Console()
-            .WriteTo.File($"{_config.LogFolder}{Path.DirectorySeparatorChar}{DateTime.Now:yyyyMMdd}.log").CreateLogger();
+
+        if (config.ShowConsole)
+        {
+            loggerConfiguration = loggerConfiguration.WriteTo.Console();
+        }
+
+        if (config.WriteLog)
+        {
+            loggerConfiguration = loggerConfiguration.WriteTo.File($"{_config.LogFolder}{Path.DirectorySeparatorChar}{DateTime.Now:yyyyMMdd}.log");
+        }
+        
+        _logger = loggerConfiguration.CreateLogger();
 
         _taskList = new Task[config.ParallelCount];
     }
@@ -61,22 +70,30 @@ public class MavenCopier
                 Directory.CreateDirectory(cachePathDir);
                 if (File.Exists(cachePath) && cacheFile.Length > 0)
                 {
-                    var text = await File.ReadAllTextAsync(cachePath);
-                    var mavenTree = JsonSerializer.Deserialize<MavenTree>(text);
-
-                    if (mavenTree != null && mavenTree.CacheExpireDate != null && mavenTree.CacheExpireDate > DateTime.Now)
+                    try
                     {
-                        _logger.Information("Found cache: {URL}", node.ToUri());
-                        DownloadSubTree(mavenTree);
+                        var text = await File.ReadAllTextAsync(cachePath);
+                        var mavenTree = JsonSerializer.Deserialize<MavenTree>(text);
 
-                        return;
+                        if (mavenTree != null && mavenTree.CacheExpireDate != null &&
+                            mavenTree.CacheExpireDate > DateTime.Now)
+                        {
+                            _logger.Information("Found Cache: {URL}", node.ToUri());
+                            DownloadSubTree(mavenTree);
+
+                            return;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore
                     }
                 }
             }
 
             if (!node.RelativeUri.EndsWith("/") && File.Exists(filePath))
             {
-                _logger.Information("Found cache: {URL}", node.ToUri());
+                _logger.Information("Found Cache: {URL}", node.ToUri());
                 
                 return;
             }

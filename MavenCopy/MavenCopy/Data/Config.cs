@@ -10,4 +10,6 @@ public class Config
     public int RetryCount { get; set; } = 10;
     public int ParallelCount { get; set; } = 10;
     public long CacheExpireDate { get; set; } = 30;
+    public bool ShowConsole { get; set; } = true;
+    public bool WriteLog { get; set; } = true;
 }
