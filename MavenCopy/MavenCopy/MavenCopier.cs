@@ -1,6 +1,8 @@
-﻿using System.Text.Json;
+﻿using System.Diagnostics;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using HtmlAgilityPack;
+using MavenCopy.Collections;
 using MavenCopy.Data;
 using Serilog;
 using Serilog.Core;
@@ -16,12 +18,10 @@ public class MavenCopier
     private readonly Task?[] _taskList;
     private readonly string _failFilename = $"{DateTime.Now:yyyyMMddHHmmssfff}_failure.log";
 
-    private int _queueIdx = 0;
     private readonly object _failLock = new();
-    private readonly object _queueLock = new();
     private readonly HttpClient _httpClient = new();
     private readonly HashSet<string> _failSets = new();
-    private readonly Queue<(MavenTreeRequest Request, int QueueId, int FailCount)> _queue = new();
+    private readonly MavenTreeDownloadQueue _queue = new();
     private readonly JsonSerializerOptions _options = new()
     {
         WriteIndented = true,
@@ -64,17 +64,18 @@ public class MavenCopier
         _taskList = new Task[config.ParallelCount];
     }
 
-    private async Task DownloadTree(int queueId, int threadId, MavenTreeRequest treeRequest, int failCount = 0)
+    private async Task DownloadTree(int threadId, MavenTreeRequest treeRequest, int priority)
     {
         Stream? response = null;
+        var timer = Stopwatch.StartNew();
         var url = treeRequest.ToUri().ToString();
-        
+
         try
         {
             var fileName = treeRequest.RelativeUri.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
             var filePath = Path.Combine(_config.BaseFolder, fileName);
             var fileInfo = new FileInfo(filePath);
-            
+
             if (File.Exists(filePath) && fileInfo.Length > 0)
             {
                 return;
@@ -83,7 +84,7 @@ public class MavenCopier
             var cachePathDir = Path.Combine(_config.CacheFolder, fileName.TrimStart(Path.DirectorySeparatorChar));
             var cachePath = Path.Combine(cachePathDir, MavenTreeCacheFileName);
             var cacheFile = new FileInfo(cachePath);
-            
+
             if (treeRequest.RelativeUri.EndsWith("/"))
             {
                 Directory.CreateDirectory(cachePathDir);
@@ -91,14 +92,17 @@ public class MavenCopier
                 {
                     try
                     {
-                        var text = await File.ReadAllTextAsync(cachePath);
-                        var mavenTree = JsonSerializer.Deserialize<MavenTree>(text);
+                        MavenTree? mavenTree;
+                        await using (var fs = new FileStream(cachePath, FileMode.Open, FileAccess.Read))
+                        {
+                            mavenTree = JsonSerializer.Deserialize<MavenTree>(fs);
+                        }
 
                         if (mavenTree != null && mavenTree.CacheExpireDate != null &&
                             mavenTree.CacheExpireDate > DateTime.Now)
                         {
-                            _logger.Information("Found Cache (Type: Directory, Url: {Url})", treeRequest.ToUri());
-                            DownloadSubTree(mavenTree.Items.Select(link => new MavenTreeRequest(treeRequest.BaseUri, string.Concat(treeRequest.RelativeUri.TrimEnd('/'), '/', link))));
+                            _logger.Information("Found Cache (QueueId: {QueueId}, Type: Directory, Url: {Url}, Elapsed: {Elapsed})", treeRequest.QueueId, treeRequest.ToUri(), timer.Elapsed);
+                            DownloadSubTree(mavenTree.Items.Select(link => new MavenTreeRequest(treeRequest.BaseUri, string.Concat(treeRequest.RelativeUri.TrimEnd('/'), '/', link), priority - 1)));
 
                             return;
                         }
@@ -112,13 +116,13 @@ public class MavenCopier
 
             if (!treeRequest.RelativeUri.EndsWith("/") && File.Exists(filePath))
             {
-                _logger.Information("Found Cache (Type: File, Url: {Url})", treeRequest.ToUri());
-                
+                _logger.Information("Found Cache (QueueId: {QueueId}, Type: File, Url: {Url}, Elapsed: {Elapsed})", treeRequest.QueueId, treeRequest.ToUri(), timer.Elapsed);
+
                 return;
             }
 
             response = await _httpClient.GetStreamAsync(treeRequest.ToUri());
-            
+
             if (treeRequest.RelativeUri.EndsWith('/'))
             {
                 var htmlDocument = new HtmlDocument();
@@ -126,38 +130,41 @@ public class MavenCopier
 
                 var htmlNode = htmlDocument.DocumentNode;
                 var linkNodes = htmlNode.SelectNodes("//a").Where(linkNode => linkNode.InnerText != "../");
-                
+
                 var links = linkNodes.Select(linkNode => linkNode.Attributes["href"].Value).ToArray();
-                
+
                 // memory free after read
                 response.Close();
-                
-                _logger.Information("Download Index Cache (QueueId: {QueueId}, ThreadId: {TaskId}, Url: {Url}, Path: {Path})", queueId, threadId, treeRequest.ToUri(), filePath);
 
                 var tree = new MavenTree(treeRequest.BaseUri, treeRequest.RelativeUri)
                 {
                     Items = links,
                     CacheExpireDate = DateTime.Now.Add(TimeSpan.FromDays(_config.CacheExpireDate))
                 };
+
+                await using (var fs = new FileStream(cacheFile.FullName, FileMode.Create, FileAccess.Write))
+                {
+                    await JsonSerializer.SerializeAsync(fs, tree, _options);
+                }
+
+                _logger.Information("Downloaded Index Cache (QueueId: {QueueId}, ThreadId: {TaskId}, Url: {Url}, Path: {Path}, Elapsed: {Elapsed})", treeRequest.QueueId, threadId, treeRequest.ToUri(), filePath, timer.Elapsed);
                 
-                await File.WriteAllTextAsync(cacheFile.FullName, JsonSerializer.Serialize(tree, _options));
-                
-                DownloadSubTree(links.Select(link => new MavenTreeRequest(treeRequest.BaseUri, string.Concat(treeRequest.RelativeUri.TrimEnd('/'), '/', link))));
+                DownloadSubTree(links.Select(link => new MavenTreeRequest(treeRequest.BaseUri, string.Concat(treeRequest.RelativeUri.TrimEnd('/'), '/', link), priority - 1)));
             }
             else
             {
-                _logger.Information("Download File (QueueId: {QueueId}, ThreadId: {TaskId}, Url: {Url}, Path: {Path})", queueId, threadId, treeRequest.ToUri(), filePath);
-
                 if (fileInfo.DirectoryName != null)
                 {
                     Directory.CreateDirectory(fileInfo.DirectoryName);
                 }
-                
+
                 await using var fileStream = new FileStream(filePath, FileMode.OpenOrCreate);
                 await response.CopyToAsync(fileStream);
+
+                _logger.Information("Downloaded File (QueueId: {QueueId}, ThreadId: {TaskId}, Url: {Url}, Path: {Path}, Elapsed: {Elapsed})", treeRequest.QueueId, threadId, treeRequest.ToUri(), filePath, timer.Elapsed);
                 response.Close();
             }
-            
+
             lock (_failLock)
             {
                 if (_failSets.Remove(url))
@@ -189,16 +196,20 @@ public class MavenCopier
                 }
             }
 
-            
-            if (failCount < _config.RetryCount)
+
+            if (treeRequest.FailCount < _config.RetryCount)
             {
-                _logger.Warning(e, "DOWNLOAD FAILED :: DownloadUrl Retry (Url: {Url}, Try: {FailCount})", treeRequest.ToUri(), failCount + 1);
-                QueueDownload(treeRequest, ++failCount);
+                _logger.Warning(e, "DOWNLOAD FAILED :: DownloadUrl Retry (Url: {Url}, Try: {FailCount})", treeRequest.ToUri(), ++treeRequest.FailCount);
+                QueueDownload(treeRequest);
             }
             else
             {
                 _logger.Error(e, "DOWNLOAD FAILED :: DownloadUrl (Url: {Url})", treeRequest.ToUri());
             }
+        }
+        finally
+        {
+            timer.Stop();
         }
     }
 
@@ -206,21 +217,17 @@ public class MavenCopier
     {
         foreach (var request in requests)
         {
-            var subTree = new MavenTreeRequest(request.BaseUri, string.Concat(request.RelativeUri));
+            var subTree = new MavenTreeRequest(request.BaseUri, string.Concat(request.RelativeUri), request.Priority);
 
-            QueueDownload(subTree, 0);
+            QueueDownload(subTree);
         }
     }
 
-    private void QueueDownload(MavenTreeRequest treeRequest, int failCount)
+    private void QueueDownload(MavenTreeRequest treeRequest)
     {
-        Monitor.Enter(_queueLock);
-        var queueId = _queueIdx;
-        _queue.Enqueue((treeRequest, queueId, failCount));
-        _queueIdx++;
-        Monitor.Exit(_queueLock);
+        _queue.Enqueue(treeRequest);
         
-        _logger.Debug("Enqueue (QueueId: {QueueId}, Url: {Url})", queueId, treeRequest.ToUri());
+        _logger.Debug("Enqueue (QueueId: {QueueId}, Url: {Url})", treeRequest.QueueId, treeRequest.ToUri());
     }
 
     public async Task Start()
@@ -245,19 +252,21 @@ public class MavenCopier
             throw new ApplicationException("Url validation failed!");
         }
 
-        var treeRequest = new MavenTreeRequest(new Uri(_config.Url), "/");
-        QueueDownload(treeRequest, 0);
+        var treeRequest = new MavenTreeRequest(new Uri(_config.Url), "/", 0);
+        QueueDownload(treeRequest);
 
-        while (_queue.Count > 0 || _taskList.Any(task => task != null))
+        while (!_queue.IsEmpty || _taskList.Any(task => task != null))
         {
             var endIdx = Array.FindIndex(_taskList, task => task?.IsCompleted ?? true);
+
+            MavenTreeRequest? request;
             
             if (endIdx >= 0)
             {
-                if (_queue.TryDequeue(out var tuple))
+                if (_queue.TryDequeue(out request))
                 {
-                    _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", tuple.QueueId, tuple.FailCount + 1, tuple.Request.ToUri());
-                    _taskList[endIdx] = DownloadTree(tuple.QueueId, endIdx, tuple.Request, tuple.FailCount);
+                    _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", request.QueueId, request.FailCount + 1, request.ToUri());
+                    _taskList[endIdx] = DownloadTree(endIdx, request, request.FailCount);
                 }
                 else
                 {
@@ -269,9 +278,9 @@ public class MavenCopier
             var tasks = _taskList.Where(task => task != null).Select(task => task!).ToList();
             var endTask = await Task.WhenAny(tasks);
             endIdx = Array.FindIndex(_taskList, task => endTask == task);
-            var item = _queue.Dequeue();
-            _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", item.QueueId, item.FailCount + 1, item.Request.ToUri());
-            _taskList[endIdx] = DownloadTree(item.QueueId, endIdx, item.Request, item.FailCount);
+            if (!_queue.TryDequeue(out request)) continue;
+            _logger.Debug("Dequeue (QueueId: {QueueId}, Try: {Try}, Url: {Url})", request.QueueId, request.FailCount + 1, request.ToUri());
+            _taskList[endIdx] = DownloadTree(endIdx, request, request.Priority);
         }
     }
 }

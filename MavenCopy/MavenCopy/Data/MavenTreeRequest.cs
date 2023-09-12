@@ -5,11 +5,21 @@ namespace MavenCopy.Data;
 [Serializable]
 public class MavenTreeRequest
 {
-    public MavenTreeRequest(Uri baseUri, string relativeUri)
+    private static int _queueIdx;
+    
+    public MavenTreeRequest(Uri baseUri, string relativeUri, int priority)
     {
+        QueueId = Interlocked.Increment(ref _queueIdx);
+        Priority = priority;
         BaseUri = baseUri;
         RelativeUri = relativeUri;
     }
+    
+    public int QueueId { get; }
+    
+    public int Priority { get; }
+    
+    public int FailCount { get; set; }
     
     public Uri BaseUri { get; set; }
     
